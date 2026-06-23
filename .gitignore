@@ -8,8 +8,9 @@ lerna-debug.log*
 
 node_modules
 
-# We explicitly DO NOT ignore the dist directory so it's visible on GitHub
-# dist
+# We explicitly DO NOT ignore the dist directory so it's visible on GitHub and included in zip/export
+!dist/
+!dist/**
 
 dist-ssr
 *.local
