@@ -1,0 +1,8 @@
+{
+  "name": " Ripple Flo php",
+  "description": "An interactive workspace app with fluid ripples and collaborative tools.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
