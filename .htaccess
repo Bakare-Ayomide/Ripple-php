@@ -1,7 +1,14 @@
 <IfModule mod_rewrite.c>
     RewriteEngine On
-    # Prevent infinite loop
+    RewriteBase /ripple/
+
+    # Rewrite API requests to the PHP backend proxy
     RewriteCond %{REQUEST_FILENAME} !-f
     RewriteCond %{REQUEST_FILENAME} !-d
     RewriteRule ^api/(.*)$ api.php?route=$1 [QSA,L]
+
+    # Fallback to index.html for Single Page App (SPA) client-side routing
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteRule . index.html [L]
 </IfModule>

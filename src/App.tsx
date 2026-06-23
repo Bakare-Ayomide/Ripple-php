@@ -35,14 +35,18 @@ const BackgroundManager = () => {
   return null;
 };
 
-const App = () => (
-  <QueryClientProvider client={queryClient}>
-    <TooltipProvider>
-      <Sonner />
-      <BrowserRouter>
-        <BackgroundManager />
-        <AuthProvider>
-          <Routes>
+const App = () => {
+  const isRippleSubdir = typeof window !== "undefined" && window.location.pathname.startsWith("/ripple");
+  const basename = isRippleSubdir ? "/ripple" : "/";
+
+  return (
+    <QueryClientProvider client={queryClient}>
+      <TooltipProvider>
+        <Sonner />
+        <BrowserRouter basename={basename}>
+          <BackgroundManager />
+          <AuthProvider>
+            <Routes>
             <Route path="/auth" element={<Auth />} />
             <Route path="/onboarding" element={<Onboarding />} />
             <Route path="/reset-password" element={<ResetPassword />} />
@@ -63,9 +67,10 @@ const App = () => (
             <Route path="*" element={<NotFound />} />
           </Routes>
         </AuthProvider>
-      </BrowserRouter>
-    </TooltipProvider>
-  </QueryClientProvider>
-);
+        </BrowserRouter>
+      </TooltipProvider>
+    </QueryClientProvider>
+  );
+};
 
 export default App;
