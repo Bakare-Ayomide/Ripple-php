@@ -89,15 +89,7 @@ function saveLocalDb() {
 // ================= FTP CONFIG AND FUNCTIONS FOR POSTS SYNC =================
 const REMOTE_DIR = '/home/zerolord/public_html/ripple.zerolord.com/ripple/post';
 
-async function saveUploadToFtp(filename: string) {
-  const localFile = path.join(uploadsDir, filename);
-  if (!fs.existsSync(localFile)) {
-    console.warn(`[FTP Upload] Local file ${filename} does not exist for FTP upload!`);
-    return;
-  }
-
-  const client = new ftp.Client();
-  client.ftp.verbose = false;
+async function connectFtpClient(client: ftp.Client): Promise<boolean> {
   try {
     await client.access({
       host: 'ftp.zerolord.com',
@@ -109,6 +101,35 @@ async function saveUploadToFtp(filename: string) {
         rejectUnauthorized: false
       }
     });
+    return true;
+  } catch (secErr: any) {
+    console.log(`[FTP Connect TLS Failed] Opting for standard plain FTP handshake... (${secErr.message || secErr})`);
+    try {
+      await client.access({
+        host: 'ftp.zerolord.com',
+        user: 'ripple@ripple.zerolord.com',
+        password: '@f33rinimi',
+        port: 21,
+        secure: false
+      });
+      return true;
+    } catch (plainErr: any) {
+      throw new Error(`FTP connection failed for both TLS and standard handshakes: ${plainErr.message || plainErr}`);
+    }
+  }
+}
+
+async function saveUploadToFtp(filename: string) {
+  const localFile = path.join(uploadsDir, filename);
+  if (!fs.existsSync(localFile)) {
+    console.warn(`[FTP Upload] Local file ${filename} does not exist for FTP upload!`);
+    return;
+  }
+
+  const client = new ftp.Client();
+  client.ftp.verbose = false;
+  try {
+    await connectFtpClient(client);
 
     // Destination 1: /home/zerolord/public_html/ripple.zerolord.com/ripple/post/uploads
     const path1 = '/home/zerolord/public_html/ripple.zerolord.com/ripple/post/uploads';
@@ -122,7 +143,7 @@ async function saveUploadToFtp(filename: string) {
     await client.uploadFrom(localFile, filename);
     console.log(`[FTP Upload] Uploaded ${filename} to ftp at ${path2}`);
   } catch (err: any) {
-    console.error(`[FTP Upload Error] Failed to upload ${filename}:`, err);
+    console.warn(`[FTP Upload Warning] Failed to upload ${filename}:`, err?.message || err);
   } finally {
     client.close();
   }
@@ -137,16 +158,7 @@ async function downloadUploadFromFtp(filename: string) {
   const client = new ftp.Client();
   client.ftp.verbose = false;
   try {
-    await client.access({
-      host: 'ftp.zerolord.com',
-      user: 'ripple@ripple.zerolord.com',
-      password: '@f33rinimi',
-      port: 21,
-      secure: true,
-      secureOptions: {
-        rejectUnauthorized: false
-      }
-    });
+    await connectFtpClient(client);
 
     // Try downloading from the post/uploads remote directory first
     const path1 = '/home/zerolord/public_html/ripple.zerolord.com/ripple/post/uploads';
@@ -169,7 +181,7 @@ async function downloadUploadFromFtp(filename: string) {
       console.warn(`[FTP Sync Asset Warning] Could not download asset ${filename} from any FTP folder:`, e.message);
     }
   } catch (err: any) {
-    console.error(`[FTP Sync Asset Error] Failed to connect or download asset ${filename}:`, err.message);
+    console.warn(`[FTP Sync Asset Warning] Failed to connect or download asset ${filename}:`, err.message || err);
   } finally {
     client.close();
   }
@@ -182,7 +194,7 @@ async function savePostToFtp(post: any) {
     for (const url of urls) {
       if (url.startsWith('/uploads/')) {
         const filename = url.replace('/uploads/', '');
-        await saveUploadToFtp(filename).catch(err => console.error('[FTP Multi-Upload Error]', err));
+        await saveUploadToFtp(filename).catch(err => console.warn('[FTP Multi-Upload Warning]', err?.message || err));
       }
     }
   }
@@ -190,16 +202,7 @@ async function savePostToFtp(post: any) {
   const client = new ftp.Client();
   client.ftp.verbose = false;
   try {
-    await client.access({
-      host: 'ftp.zerolord.com',
-      user: 'ripple@ripple.zerolord.com',
-      password: '@f33rinimi',
-      port: 21,
-      secure: true,
-      secureOptions: {
-        rejectUnauthorized: false
-      }
-    });
+    await connectFtpClient(client);
     await client.ensureDir(REMOTE_DIR);
     
     // Create local temp file
@@ -214,7 +217,7 @@ async function savePostToFtp(post: any) {
     }
     console.log(`[FTP] Successfully uploaded/updated post ${post.id}.json on FTP`);
   } catch (err: any) {
-    console.error(`[FTP Error] Failed to upload/update post ${post.id}:`, err);
+    console.warn(`[FTP Sync Warning] Failed to upload/update post ${post.id}:`, err?.message || err);
   } finally {
     client.close();
   }
@@ -241,8 +244,8 @@ async function savePostIdToFtp(postId: string) {
     } else {
       console.warn(`[FTP Sync] Post with ID ${postId} was not found in DB or local fallback store for FTP upload.`);
     }
-  } catch (err) {
-    console.error(`[FTP Sync Error] Failed to process post ID ${postId} for upload:`, err);
+  } catch (err: any) {
+    console.warn(`[FTP Sync Warning] Failed to process post ID ${postId} for upload:`, err?.message || err);
   }
 }
 
@@ -250,21 +253,12 @@ async function deletePostFromFtp(postId: string) {
   const client = new ftp.Client();
   client.ftp.verbose = false;
   try {
-    await client.access({
-      host: 'ftp.zerolord.com',
-      user: 'ripple@ripple.zerolord.com',
-      password: '@f33rinimi',
-      port: 21,
-      secure: true,
-      secureOptions: {
-        rejectUnauthorized: false
-      }
-    });
+    await connectFtpClient(client);
     await client.ensureDir(REMOTE_DIR);
     await client.remove(`${postId}.json`).catch(() => {});
     console.log(`[FTP] Successfully deleted post ${postId}.json from FTP`);
   } catch (err: any) {
-    console.error(`[FTP Error] Failed to delete post ${postId} from FTP:`, err);
+    console.warn(`[FTP Sync Warning] Failed to delete post ${postId} from FTP:`, err?.message || err);
   } finally {
     client.close();
   }
@@ -288,7 +282,7 @@ async function upsertPostToDatabase(postObj: any) {
     for (const url of urls) {
       if (url.startsWith('/uploads/')) {
         const filename = url.replace('/uploads/', '');
-        downloadUploadFromFtp(filename).catch(err => console.error('[FTP Sync Asset Error]', err));
+        downloadUploadFromFtp(filename).catch(err => console.warn('[FTP Sync Asset Error]', err));
       }
     }
   }
@@ -338,16 +332,7 @@ async function syncPostsFromFtp(force = false) {
   const client = new ftp.Client();
   client.ftp.verbose = false;
   try {
-    await client.access({
-      host: 'ftp.zerolord.com',
-      user: 'ripple@ripple.zerolord.com',
-      password: '@f33rinimi',
-      port: 21,
-      secure: true,
-      secureOptions: {
-        rejectUnauthorized: false
-      }
-    });
+    await connectFtpClient(client);
 
     await client.ensureDir(REMOTE_DIR);
     const files = await client.list();
@@ -384,7 +369,7 @@ async function syncPostsFromFtp(force = false) {
           const postObj = JSON.parse(raw);
           await upsertPostToDatabase(postObj);
         } catch (downloadErr: any) {
-          console.error(`[FTP Sync Error] Failed to download post ${file.name}:`, downloadErr.message);
+          console.warn(`[FTP Sync Warning] Failed to download post ${file.name}:`, downloadErr.message || downloadErr);
         } finally {
           if (fs.existsSync(tempFile)) {
             fs.unlinkSync(tempFile);
@@ -393,7 +378,7 @@ async function syncPostsFromFtp(force = false) {
       }
     }
   } catch (err: any) {
-    console.error('[FTP Sync Error] general sync failed:', err.message);
+    console.warn('[FTP Sync Warning] general sync failed:', err.message || err);
   } finally {
     client.close();
     isSyncingFtp = false;
@@ -921,7 +906,7 @@ async function executeFallbackSync(table: string, actions: any[], res: any) {
 
     if (queryType === 'select') {
       if (table === 'posts') {
-        await syncPostsFromFtp().catch(err => console.error('[FTP Fallback Select Sync Error]', err));
+        await syncPostsFromFtp().catch(err => console.warn('[FTP Fallback Select Sync Error]', err));
       }
       let matched = tableArray.filter((item: any) => matchesFilter(item, actions));
 
@@ -1045,7 +1030,7 @@ async function executeFallbackSync(table: string, actions: any[], res: any) {
           const post = localDb.posts.find(p => p.id === item.post_id);
           if (post) {
             post.likes_count = (post.likes_count || 0) + 1;
-            await savePostToFtp(post).catch(err => console.error('[FTP Fallback Like Sync Error]', err));
+            await savePostToFtp(post).catch(err => console.warn('[FTP Fallback Like Sync Error]', err));
             // Notification
             if (post.user_id !== item.user_id) {
               localDb.notifications.push({
@@ -1064,7 +1049,7 @@ async function executeFallbackSync(table: string, actions: any[], res: any) {
           const post = localDb.posts.find(p => p.id === item.post_id);
           if (post) {
             post.comments_count = (post.comments_count || 0) + 1;
-            await savePostToFtp(post).catch(err => console.error('[FTP Fallback Comment Sync Error]', err));
+            await savePostToFtp(post).catch(err => console.warn('[FTP Fallback Comment Sync Error]', err));
             // Notification
             if (post.user_id !== item.user_id) {
               localDb.notifications.push({
@@ -1081,7 +1066,7 @@ async function executeFallbackSync(table: string, actions: any[], res: any) {
           }
           handleMentions(item.content, item.user_id, item.post_id, true, true);
         } else if (table === 'posts') {
-          await savePostToFtp(item).catch(err => console.error('[FTP Fallback Post Insert Sync Error]', err));
+          await savePostToFtp(item).catch(err => console.warn('[FTP Fallback Post Insert Sync Error]', err));
         } else if (table === 'follows') {
           const isFollowBack = localDb.follows.some(f => f.follower_id === item.following_id && f.following_id === item.follower_id);
           // Notification
@@ -1150,7 +1135,7 @@ async function executeFallbackSync(table: string, actions: any[], res: any) {
       for (const item of matched) {
         Object.assign(item, updateValues);
         if (table === 'posts') {
-          await savePostToFtp(item).catch(err => console.error('[FTP Fallback Post Update Sync Error]', err));
+          await savePostToFtp(item).catch(err => console.warn('[FTP Fallback Post Update Sync Error]', err));
         }
       }
       saveLocalDb();
@@ -1163,16 +1148,16 @@ async function executeFallbackSync(table: string, actions: any[], res: any) {
           const post = localDb.posts.find(p => p.id === item.post_id);
           if (post) {
             post.likes_count = Math.max(0, (post.likes_count || 0) - 1);
-            await savePostToFtp(post).catch(err => console.error('[FTP Fallback Like Decr Error]', err));
+            await savePostToFtp(post).catch(err => console.warn('[FTP Fallback Like Decr Error]', err));
           }
         } else if (table === 'comments') {
           const post = localDb.posts.find(p => p.id === item.post_id);
           if (post) {
             post.comments_count = Math.max(0, (post.comments_count || 0) - 1);
-            await savePostToFtp(post).catch(err => console.error('[FTP Fallback Comment Decr Error]', err));
+            await savePostToFtp(post).catch(err => console.warn('[FTP Fallback Comment Decr Error]', err));
           }
         } else if (table === 'posts') {
-          await deletePostFromFtp(item.id).catch(err => console.error('[FTP Fallback Post Delete Error]', err));
+          await deletePostFromFtp(item.id).catch(err => console.warn('[FTP Fallback Post Delete Error]', err));
         }
         
         const index = tableArray.indexOf(item);
@@ -1240,13 +1225,13 @@ app.get('/uploads/:filename', async (req, res) => {
 // Initialize DB asynchronously
 initDb().then(() => {
   // Initial forced sync of posts from FTP server to localDB and MySQL on startup
-  syncPostsFromFtp(true).catch(err => console.error('[FTP Startup Sync Error]', err));
+  syncPostsFromFtp(true).catch(err => console.warn('[FTP Startup Sync Error]', err));
 });
 
 // Periodically pull/sync posts in background every 60 seconds to detect additions from other clients (only if not on Vercel)
 if (process.env.VERCEL !== '1') {
   setInterval(() => {
-    syncPostsFromFtp().catch(err => console.error('[FTP Interval Sync Error]', err));
+    syncPostsFromFtp().catch(err => console.warn('[FTP Interval Sync Error]', err));
   }, 60000);
 }
 
@@ -1274,7 +1259,7 @@ app.get('/api/admin/db-status', (req, res) => {
     
     // Upload standard uploaded media to FTP
     saveUploadToFtp(req.file.filename).catch(err => {
-      console.error('[FTP Upload Handshake Error]', err);
+      console.warn('[FTP Upload Handshake Error]', err);
     });
 
     res.json({ publicUrl });
@@ -1676,7 +1661,7 @@ app.get('/api/admin/db-status', (req, res) => {
 
     // Sync to FTP if basic-ftp operates
     saveUploadToFtp(req.file.filename).catch(err => {
-      console.error('[FTP Default Avatar Sync Error]', err);
+      console.warn('[FTP Default Avatar Sync Error]', err);
     });
 
     res.json({ success: true, configs: currentConfigs, url: publicUrl });
@@ -1933,7 +1918,7 @@ app.get('/api/admin/db-status', (req, res) => {
       saveLocalDb();
 
       // Upload to FTP
-      await savePostIdToFtp(postId).catch(err => console.error('[FTP Admin Create Error]', err));
+      await savePostIdToFtp(postId).catch(err => console.warn('[FTP Admin Create Error]', err));
 
       res.json({ success: true, postId });
     } catch (err: any) {
@@ -1969,7 +1954,7 @@ app.get('/api/admin/db-status', (req, res) => {
       }
 
       // Update on FTP
-      await savePostIdToFtp(id).catch(err => console.error('[FTP Admin Update Error]', err));
+      await savePostIdToFtp(id).catch(err => console.warn('[FTP Admin Update Error]', err));
 
       res.json({ success: true });
     } catch (err: any) {
@@ -1998,7 +1983,7 @@ app.get('/api/admin/db-status', (req, res) => {
       saveLocalDb();
 
       // Delete from FTP
-      await deletePostFromFtp(id).catch(err => console.error('[FTP Admin Delete Error]', err));
+      await deletePostFromFtp(id).catch(err => console.warn('[FTP Admin Delete Error]', err));
 
       res.json({ success: true });
     } catch (err: any) {
@@ -2153,7 +2138,7 @@ app.get('/api/admin/db-status', (req, res) => {
 
       if (queryType === 'select') {
         if (table === 'posts') {
-          await syncPostsFromFtp().catch(err => console.error('[FTP Select Sync Error]', err));
+          await syncPostsFromFtp().catch(err => console.warn('[FTP Select Sync Error]', err));
         }
         let sql = '';
         if (table === 'posts') {
@@ -2295,7 +2280,7 @@ app.get('/api/admin/db-status', (req, res) => {
           // MySQL Trigger-Like counts updates mimicry
           if (table === 'likes') {
             await pool.query('UPDATE posts SET likes_count = likes_count + 1 WHERE id = ?', [item.post_id]);
-            await savePostIdToFtp(item.post_id).catch(err => console.error('[FTP Like Sync Error]', err));
+            await savePostIdToFtp(item.post_id).catch(err => console.warn('[FTP Like Sync Error]', err));
             try {
               const [postRows]: any = await pool.query('SELECT user_id FROM posts WHERE id = ?', [item.post_id]);
               if (postRows.length > 0 && postRows[0].user_id !== item.user_id) {
@@ -2310,7 +2295,7 @@ app.get('/api/admin/db-status', (req, res) => {
           }
           if (table === 'comments') {
             await pool.query('UPDATE posts SET comments_count = comments_count + 1 WHERE id = ?', [item.post_id]);
-            await savePostIdToFtp(item.post_id).catch(err => console.error('[FTP Comment Sync Error]', err));
+            await savePostIdToFtp(item.post_id).catch(err => console.warn('[FTP Comment Sync Error]', err));
             try {
               const [postRows]: any = await pool.query('SELECT user_id FROM posts WHERE id = ?', [item.post_id]);
               if (postRows.length > 0 && postRows[0].user_id !== item.user_id) {
@@ -2341,7 +2326,7 @@ app.get('/api/admin/db-status', (req, res) => {
           }
           if (table === 'posts') {
             await handleMentions(item.caption, item.user_id, item.id, false, false);
-            await savePostIdToFtp(item.id).catch(err => console.error('[FTP Post Insert Sync Error]', err));
+            await savePostIdToFtp(item.id).catch(err => console.warn('[FTP Post Insert Sync Error]', err));
           }
           if (table === 'messages') {
             try {
@@ -2413,20 +2398,20 @@ app.get('/api/admin/db-status', (req, res) => {
           const [likesRows]: any = await pool.query(`SELECT * FROM likes ${whereSql}`, params);
           for (const r of likesRows) {
             await pool.query('UPDATE posts SET likes_count = GREATEST(0, likes_count - 1) WHERE id = ?', [r.post_id]);
-            await savePostIdToFtp(r.post_id).catch(err => console.error('[FTP Like Decr Sync Error]', err));
+            await savePostIdToFtp(r.post_id).catch(err => console.warn('[FTP Like Decr Sync Error]', err));
           }
         }
         if (table === 'comments' && wClauses.length > 0) {
           const [commentsRows]: any = await pool.query(`SELECT * FROM comments ${whereSql}`, params);
           for (const r of commentsRows) {
             await pool.query('UPDATE posts SET comments_count = GREATEST(0, comments_count - 1) WHERE id = ?', [r.post_id]);
-            await savePostIdToFtp(r.post_id).catch(err => console.error('[FTP Comment Decr Sync Error]', err));
+            await savePostIdToFtp(r.post_id).catch(err => console.warn('[FTP Comment Decr Sync Error]', err));
           }
         }
         if (table === 'posts') {
           const idAction = actions.find((a: any) => a.type === 'eq' && a.column === 'id');
           if (idAction) {
-            await deletePostFromFtp(idAction.value).catch(err => console.error('[FTP Delete Post Error]', err));
+            await deletePostFromFtp(idAction.value).catch(err => console.warn('[FTP Delete Post Error]', err));
           }
         }
 

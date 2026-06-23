@@ -3,17 +3,14 @@ logs
 *.log
 npm-debug.log*
 yarn-debug.log*
+yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
 node_modules
 
-# We explicitly DO NOT ignore the dist directory so it's visible on GitHub
-# dist
-
 dist-ssr
 *.local
-
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
@@ -24,3 +21,4 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+2
