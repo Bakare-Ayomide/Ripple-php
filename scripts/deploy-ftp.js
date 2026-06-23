@@ -2,142 +2,105 @@ import * as ftp from "basic-ftp";
 import * as path from "path";
 import * as fs from "fs";
 
-async function deploy() {
+async function runDeployment() {
   console.log("-----------------------------------------");
   console.log("🚀 Starting Ripple FTP cPanel Deployment");
   console.log("-----------------------------------------");
 
   const client = new ftp.Client();
-  client.ftp.verbose = false; // We will handle our own clean, detailed logging
-
-  const ftpHost = "131.153.147.178";
-  const ftpUser = "ripple@ripple.zerolord.com";
-  const ftpPassword = process.env.FTP_PASSWORD || "@F33rinimicinode";
+  client.ftp.verbose = true;
 
   try {
-    const uploadPlan = [];
-    const distPath = path.join(process.cwd(), "dist");
-
-    // 1. Crawl 'dist' directory for built frontend client assets
-    if (fs.existsSync(distPath)) {
-      function crawl(dirPath, remoteDir) {
-        const items = fs.readdirSync(dirPath);
-        for (const item of items) {
-          const localFilePath = path.join(dirPath, item);
-          const remoteFilePath = path.posix.join(remoteDir, item);
-          if (fs.statSync(localFilePath).isDirectory()) {
-            crawl(localFilePath, remoteFilePath);
-          } else {
-            uploadPlan.push({
-              local: localFilePath,
-              remoteDir: remoteDir,
-              remoteFile: item,
-              remoteFull: remoteFilePath.startsWith("./") ? remoteFilePath : "./" + remoteFilePath
-            });
-          }
-        }
+    console.log("🔒 Connecting with explicit FTPS (Port 21)...");
+    await client.access({
+      host: "ftp.zerolord.com",
+      user: "ripple@ripple.zerolord.com",
+      password: "@f33rinimi",
+      port: 21,
+      secure: true,
+      secureOptions: {
+        rejectUnauthorized: false
       }
-      crawl(distPath, ".");
-    } else {
-      throw new Error("Local build 'dist' directory not found. Please run 'npm run build' first before deploying.");
-    }
-
-    // 2. Add backend PHP API entrypoint
-    const apiPhpPath = path.join(process.cwd(), "api.php");
-    if (fs.existsSync(apiPhpPath)) {
-      uploadPlan.push({
-        local: apiPhpPath,
-        remoteDir: "backend",
-        remoteFile: "api.php",
-        remoteFull: "./backend/api.php"
-      });
-    }
-
-    // 3. Add .htaccess redirection rules
-    const htaccessPath = path.join(process.cwd(), ".htaccess");
-    if (fs.existsSync(htaccessPath)) {
-      uploadPlan.push({
-        local: htaccessPath,
-        remoteDir: ".",
-        remoteFile: ".htaccess",
-        remoteFull: "./.htaccess"
-      });
-    }
-
-    // Print the proposed plan for immediate verification as requested by the user
-    console.log("\n=================================================================");
-    console.log("📋 PROPOSED DEPLOYMENT UPLOAD PREVIEW");
-    console.log("=================================================================");
-    for (const item of uploadPlan) {
-      console.log(`📍 Source: ${path.relative(process.cwd(), item.local)}`);
-      console.log(`   ➡️ Target:  ${item.remoteFull}`);
-    }
-    console.log("\n📁 Directories to verify/create:");
-    console.log("   - ./uploads");
-    console.log("   - ./posts");
-    console.log("   - ./backend");
-    console.log("=================================================================\n");
-
-    console.log(`🔒 Connecting to ${ftpHost} as ${ftpUser}...`);
-    let connected = false;
+    });
+    console.log("✅ Secure FTPS Connection established.");
+  } catch (secErr) {
+    const errorMsg = secErr instanceof Error ? secErr.message : String(secErr);
+    console.warn(`⚠️ Secure connection failed: ${errorMsg}`);
+    console.log("🔌 Retrying with standard plain FTP connection...");
     try {
-      client.ftp.timeout = 10000; // 10 seconds timeout for TLS handshake
       await client.access({
-        host: ftpHost,
-        user: ftpUser,
-        password: ftpPassword,
-        port: 21,
-        secure: true,
-        secureOptions: {
-          rejectUnauthorized: false
-        }
-      });
-      console.log("✅ Secure FTPS Connection established.");
-      connected = true;
-    } catch (tlsErr) {
-      console.warn(`⚠️ Secure connection attempt failed (${tlsErr.message}). Retrying over standard FTP...`);
-      client.close();
-    }
-
-    if (!connected) {
-      await client.access({
-        host: ftpHost,
-        user: ftpUser,
-        password: ftpPassword,
+        host: "ftp.zerolord.com",
+        user: "ripple@ripple.zerolord.com",
+        password: "@f33rinimi",
         port: 21,
         secure: false
       });
-      console.log("✅ Standard FTP Connection established.");
+      console.log("✅ Plain FTP Connection established.");
+    } catch (err) {
+      const finalMsg = err instanceof Error ? err.message : String(err);
+      console.error(`❌ FTP Connection failed: ${finalMsg}`);
+      process.exit(1);
+    }
+  }
+
+  const remoteRootDir = "/home/zerolord/public_html/ripple.zerolord.com";
+  console.log(`📁 Navigating to target directory: ${remoteRootDir}`);
+
+  try {
+    await client.ensureDir(remoteRootDir);
+    
+    console.log("🖥️ Uploading frontend static assets from 'dist' directory to root...");
+    const distPath = path.join(process.cwd(), "dist");
+    if (!fs.existsSync(distPath)) {
+      throw new Error(`Local build 'dist' directory not found. Please run 'npm run build' first.`);
+    }
+    
+    // ensureDir is at remoteRootDir, uploadFromDir transfers files recursively maintaining hierarchy
+    await client.uploadFromDir(distPath);
+    console.log("✅ All compiled files inside 'dist' uploaded to root.");
+
+    console.log("⚙️ Uploading backend files to /backend subfolder...");
+    const backendRemoteDir = `${remoteRootDir}/backend`;
+    await client.ensureDir(backendRemoteDir);
+    
+    const apiPhpPath = path.join(process.cwd(), "api.php");
+    if (fs.existsSync(apiPhpPath)) {
+      console.log("📤 Uploading api.php to /backend/api.php...");
+      await client.uploadFrom(apiPhpPath, "api.php");
+      console.log("✅ api.php uploaded successfully under /backend.");
+    } else {
+      console.warn("⚠️ Local api.php file not found, skipping.");
     }
 
-    // Ensure stateful base folder environments are setup
-    console.log("📂 Verifying stateful public directories on cPanel...");
-    await client.ensureDir("uploads");
-    await client.ensureDir("posts");
-    await client.ensureDir("backend");
+    // Go back to remote root to upload HTACCESS and create posts directory
+    await client.ensureDir(remoteRootDir);
 
-    console.log("📤 Starting secure sequential file uploads...");
-    for (const item of uploadPlan) {
-      console.log(`🚀 Uploading: [Local] ${path.relative(process.cwd(), item.local)}`);
-      console.log(`   ➡️  To Remote Path: ${item.remoteFull}`);
-      
-      // Ensure specific target directory exists and navigate into it
-      await client.ensureDir(item.remoteDir);
-      // Upload under the current target directory
-      await client.uploadFrom(item.local, item.remoteFile);
+    const htaccessPath = path.join(process.cwd(), ".htaccess");
+    if (fs.existsSync(htaccessPath)) {
+      console.log("📤 Uploading .htaccess...");
+      await client.uploadFrom(htaccessPath, ".htaccess");
+      console.log("✅ .htaccess uploaded successfully at root.");
+    } else {
+      console.warn("⚠️ Local .htaccess file not found, skipping.");
     }
+
+    // Pre-create public directories to prevent first-run errors
+    console.log("📂 Ensuring public folders '/uploads' and '/posts' exist on remote server...");
+    await client.ensureDir(`${remoteRootDir}/uploads`);
+    await client.ensureDir(`${remoteRootDir}/posts`);
 
     console.log("\n=========================================");
     console.log("🎉 SUCCESS! Deployment of Ripple is complete.");
-    console.log("🌐 Live URL: https://ripple.zerolord.com");
+    console.log(`🌐 Live URL: https://ripple.zerolord.com`);
     console.log("=========================================");
 
   } catch (err) {
-    console.error("\n❌ Deployment failed:", err);
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    console.error(`❌ Deployment failed with error: ${errorMsg}`);
     process.exit(1);
   } finally {
     client.close();
   }
 }
 
-deploy();
+runDeployment();
