@@ -47,20 +47,14 @@ interface DbStore {
   notifications: any[];
   user_roles: any[];
   saved_posts: any[];
+  content_propagation?: any[];
+  system_settings?: any[];
 }
 
 const dbFilePath = path.join(uploadsDir, 'local_db.json');
 
 function loadLocalDb(): DbStore {
-  try {
-    if (fs.existsSync(dbFilePath)) {
-      const content = fs.readFileSync(dbFilePath, 'utf8');
-      return JSON.parse(content);
-    }
-  } catch (err) {
-    console.error('[Fallback DB] Load error:', err);
-  }
-  return {
+  let db: DbStore = {
     users: [],
     profiles: [],
     posts: [],
@@ -72,8 +66,28 @@ function loadLocalDb(): DbStore {
     story_views: [],
     notifications: [],
     user_roles: [],
-    saved_posts: []
+    saved_posts: [],
+    content_propagation: [],
+    system_settings: [
+      { id: '1', enable_propagation_tracking: true, max_propagation_depth: 10 }
+    ]
   };
+  try {
+    if (fs.existsSync(dbFilePath)) {
+      const content = fs.readFileSync(dbFilePath, 'utf8');
+      const parsed = JSON.parse(content);
+      db = { ...db, ...parsed };
+    }
+  } catch (err) {
+    console.error('[Fallback DB] Load error:', err);
+  }
+  if (!db.content_propagation) db.content_propagation = [];
+  if (!db.system_settings || db.system_settings.length === 0) {
+    db.system_settings = [
+      { id: '1', enable_propagation_tracking: true, max_propagation_depth: 10 }
+    ];
+  }
+  return db;
 }
 
 const localDb = loadLocalDb();
@@ -593,6 +607,17 @@ async function initDb() {
         // column likely already exists
       }
 
+      // Add scheduled & time capsule columns
+      try { await verifiedConn.query("ALTER TABLE posts ADD COLUMN scheduled_for TIMESTAMP NULL DEFAULT NULL"); } catch (err) { void err; }
+      try { await verifiedConn.query("ALTER TABLE posts ADD COLUMN is_time_capsule BOOLEAN DEFAULT FALSE"); } catch (err) { void err; }
+      try { await verifiedConn.query("ALTER TABLE posts ADD COLUMN unlocks_at TIMESTAMP NULL DEFAULT NULL"); } catch (err) { void err; }
+      try { await verifiedConn.query("ALTER TABLE posts ADD COLUMN is_recurring BOOLEAN DEFAULT FALSE"); } catch (err) { void err; }
+      try { await verifiedConn.query("ALTER TABLE posts ADD COLUMN recurrence_interval VARCHAR(50) DEFAULT NULL"); } catch (err) { void err; }
+      try { await verifiedConn.query("ALTER TABLE posts ADD COLUMN is_published BOOLEAN DEFAULT TRUE"); } catch (err) { void err; }
+      try { await verifiedConn.query("ALTER TABLE posts ADD COLUMN status VARCHAR(50) DEFAULT 'published'"); } catch (err) { void err; }
+      try { await verifiedConn.query("ALTER TABLE posts ADD COLUMN is_moderated BOOLEAN DEFAULT FALSE"); } catch (err) { void err; }
+      try { await verifiedConn.query("ALTER TABLE system_settings ADD COLUMN max_scheduling_duration_days INT DEFAULT 365"); } catch (err) { void err; }
+
       // Ensure at least one admin exists if any users are registered
       try {
         const [usersList]: any = await verifiedConn.query('SELECT id FROM users LIMIT 1');
@@ -914,6 +939,23 @@ async function executeFallbackSync(table: string, actions: any[], res: any) {
       if (table === 'posts') {
         matched = matched.map((p: any) => {
           const prof = localDb.profiles.find(pr => pr.user_id === p.user_id) || {};
+          let parentPostInfo: any = null;
+          if (p.parent_post_id) {
+            const parent = localDb.posts.find(x => x.id === p.parent_post_id);
+            if (parent) {
+              const parentProf = localDb.profiles.find(pr => pr.user_id === parent.user_id) || {};
+              parentPostInfo = {
+                id: parent.id,
+                caption: parent.caption,
+                image_url: parent.image_url,
+                media_type: parent.media_type,
+                user_id: parent.user_id,
+                username: parentProf.username,
+                display_name: parentProf.display_name,
+                avatar_url: parentProf.avatar_url
+              };
+            }
+          }
           return {
             ...p,
             is_verified: !!p.is_verified,
@@ -922,7 +964,8 @@ async function executeFallbackSync(table: string, actions: any[], res: any) {
               display_name: prof.display_name,
               avatar_url: prof.avatar_url,
               is_verified: !!prof.is_verified
-            }
+            },
+            parent_post: parentPostInfo
           };
         });
       } else if (table === 'comments') {
@@ -974,6 +1017,54 @@ async function executeFallbackSync(table: string, actions: any[], res: any) {
           ...r,
           is_read: !!r.is_read
         }));
+      } else if (table === 'content_propagation') {
+        matched = matched.map((cp: any) => {
+          const prof = localDb.profiles.find(pr => pr.user_id === cp.user_id) || {};
+          const parentProf = localDb.profiles.find(pr => pr.user_id === cp.parent_user_id) || {};
+          const originalProf = localDb.profiles.find(pr => pr.user_id === cp.original_user_id) || {};
+          const post = localDb.posts.find(p => p.id === cp.post_id) || {};
+          const parentPost = localDb.posts.find(p => p.id === cp.parent_post_id) || {};
+          const originalPost = localDb.posts.find(p => p.id === cp.original_post_id) || {};
+          return {
+            ...cp,
+            profiles: {
+              username: prof.username,
+              display_name: prof.display_name,
+              avatar_url: prof.avatar_url,
+              is_verified: !!prof.is_verified,
+              hide_propagation_details: !!prof.hide_propagation_details
+            },
+            parent_profile: {
+              username: parentProf.username,
+              display_name: parentProf.display_name,
+              avatar_url: parentProf.avatar_url,
+              is_verified: !!parentProf.is_verified,
+              hide_propagation_details: !!parentProf.hide_propagation_details
+            },
+            original_profile: {
+              username: originalProf.username,
+              display_name: originalProf.display_name,
+              avatar_url: originalProf.avatar_url,
+              is_verified: !!originalProf.is_verified,
+              hide_propagation_details: !!originalProf.hide_propagation_details
+            },
+            post: {
+              caption: post.caption,
+              image_url: post.image_url,
+              created_at: post.created_at
+            },
+            parent_post: {
+              caption: parentPost.caption,
+              image_url: parentPost.image_url,
+              created_at: parentPost.created_at
+            },
+            original_post: {
+              caption: originalPost.caption,
+              image_url: originalPost.image_url,
+              created_at: originalPost.created_at
+            }
+          };
+        });
       }
 
       // Orderings
@@ -1927,16 +2018,31 @@ app.get('/api/admin/db-status', (req, res) => {
   });
 
   app.post('/api/admin/posts/update', async (req, res) => {
-    const { id, caption, image_url, media_type } = req.body;
+    const { id } = req.body;
     if (!id) return res.status(400).send('Missing post id.');
+
+    const fields = [
+      'caption', 'image_url', 'media_type', 'is_moderated',
+      'status', 'is_published', 'scheduled_for', 'unlocks_at',
+      'is_recurring', 'recurrence_interval'
+    ];
 
     try {
       if (pool && !useLocalFallback) {
         const updateFields: string[] = [];
         const params: any[] = [];
-        if (caption !== undefined) { updateFields.push('caption = ?'); params.push(caption); }
-        if (image_url !== undefined) { updateFields.push('image_url = ?'); params.push(image_url); }
-        if (media_type !== undefined) { updateFields.push('media_type = ?'); params.push(media_type); }
+        
+        for (const field of fields) {
+          if (req.body[field] !== undefined) {
+            updateFields.push(`${field} = ?`);
+            const val = req.body[field];
+            if (typeof val === 'boolean') {
+              params.push(val ? 1 : 0);
+            } else {
+              params.push(val);
+            }
+          }
+        }
 
         if (updateFields.length > 0) {
           params.push(id);
@@ -1946,9 +2052,11 @@ app.get('/api/admin/db-status', (req, res) => {
 
       const p = localDb.posts.find(x => x.id === id);
       if (p) {
-        if (caption !== undefined) p.caption = caption;
-        if (image_url !== undefined) p.image_url = image_url;
-        if (media_type !== undefined) p.media_type = media_type;
+        for (const field of fields) {
+          if (req.body[field] !== undefined) {
+            (p as any)[field] = req.body[field];
+          }
+        }
         p.updated_at = new Date().toISOString();
         saveLocalDb();
       }
@@ -1988,6 +2096,395 @@ app.get('/api/admin/db-status', (req, res) => {
       res.json({ success: true });
     } catch (err: any) {
       res.status(500).send(err.message);
+    }
+  });
+
+  // ================= CONTENT PROPAGATION ENDPOINTS =================
+  app.post('/api/propagation/share', async (req, res) => {
+    try {
+      const { postId, userId, shareType, caption } = req.body;
+      if (!postId || !userId || !shareType) {
+        return res.status(400).json({ error: 'Missing required parameters' });
+      }
+
+      // Check settings
+      const settings = localDb.system_settings?.[0] || { enable_propagation_tracking: true, max_propagation_depth: 10 };
+
+      // Find parent post
+      const parentPost = localDb.posts.find(p => p.id === postId);
+      if (!parentPost) {
+        return res.status(404).json({ error: 'Parent post not found' });
+      }
+
+      // Determine parent depth and original post
+      const parentDepth = parentPost.propagation_depth || 0;
+      const depth = parentDepth + 1;
+
+      // Check max propagation depth limit
+      if (depth > settings.max_propagation_depth) {
+        return res.status(400).json({ error: `Sharing blocked: Maximum propagation depth of ${settings.max_propagation_depth} reached.` });
+      }
+
+      const originalPostId = parentPost.original_post_id || parentPost.id;
+      const originalUserId = parentPost.original_user_id || parentPost.user_id;
+
+      // Create new post ID
+      const newPostId = crypto.randomUUID();
+
+      const newPost = {
+        id: newPostId,
+        user_id: userId,
+        caption: shareType === 'quote' ? (caption || '') : `[REPOST]`,
+        image_url: parentPost.image_url,
+        media_type: parentPost.media_type || 'image',
+        likes_count: 0,
+        comments_count: 0,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+        original_post_id: originalPostId,
+        parent_post_id: parentPost.id,
+        share_type: shareType,
+        propagation_depth: depth,
+        original_user_id: originalUserId
+      };
+
+      localDb.posts.push(newPost);
+
+      // Create propagation record if enabled
+      let cpRecord = null;
+      if (settings.enable_propagation_tracking) {
+        cpRecord = {
+          id: crypto.randomUUID(),
+          post_id: newPostId,
+          original_post_id: originalPostId,
+          parent_post_id: parentPost.id,
+          user_id: userId,
+          parent_user_id: parentPost.user_id,
+          original_user_id: originalUserId,
+          share_type: shareType,
+          depth: depth,
+          created_at: newPost.created_at
+        };
+        if (!localDb.content_propagation) localDb.content_propagation = [];
+        localDb.content_propagation.push(cpRecord);
+      }
+
+      // Create notification for the immediate parent user if it's not the same user
+      if (parentPost.user_id !== userId) {
+        localDb.notifications.push({
+          id: crypto.randomUUID(),
+          recipient_id: parentPost.user_id,
+          actor_id: userId,
+          type: shareType,
+          post_id: newPostId,
+          content: shareType === 'repost' ? 'reposted your wave.' : 'quoted your wave.',
+          is_read: false,
+          created_at: new Date().toISOString()
+        });
+      }
+
+      // Also create notification for the original creator if they are different from parent and from current user
+      if (originalUserId !== parentPost.user_id && originalUserId !== userId) {
+        localDb.notifications.push({
+          id: crypto.randomUUID(),
+          recipient_id: originalUserId,
+          actor_id: userId,
+          type: shareType,
+          post_id: newPostId,
+          content: `shared your original wave (via @${(localDb.profiles.find(p => p.user_id === parentPost.user_id)?.username || 'user')}).`,
+          is_read: false,
+          created_at: new Date().toISOString()
+        });
+      }
+
+      saveLocalDb();
+
+      // Return the new post
+      res.json({ success: true, post: newPost, propagation: cpRecord });
+    } catch (err: any) {
+      console.error('Share error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/propagation/stats/:postId', async (req, res) => {
+    try {
+      const { postId } = req.params;
+      const post = localDb.posts.find(p => p.id === postId);
+      if (!post) {
+        return res.status(404).json({ error: 'Post not found' });
+      }
+
+      const originalPostId = post.original_post_id || post.id;
+      const originalPost = localDb.posts.find(p => p.id === originalPostId) || post;
+      
+      const propagationRecords = (localDb.content_propagation || []).filter(
+        (cp: any) => cp.original_post_id === originalPostId
+      );
+
+      const resolveProfile = (uid: string) => {
+        const prof = localDb.profiles.find(p => p.user_id === uid);
+        if (!prof) return { username: 'unknown', display_name: 'Unknown Member', avatar_url: `https://api.dicebear.com/7.x/adventurer/svg?seed=${uid}`, is_verified: false, hide_propagation_details: false };
+        
+        if (prof.hide_propagation_details) {
+          return {
+            username: 'anonymous',
+            display_name: 'Anonymous Wave',
+            avatar_url: 'https://api.dicebear.com/7.x/adventurer/svg?seed=anonymous',
+            is_verified: false,
+            hide_propagation_details: true
+          };
+        }
+        
+        return {
+          username: prof.username || 'user',
+          display_name: prof.display_name || 'Member',
+          avatar_url: prof.avatar_url || `https://api.dicebear.com/7.x/adventurer/svg?seed=${uid}`,
+          is_verified: !!prof.is_verified,
+          hide_propagation_details: false
+        };
+      };
+
+      const nodes: any[] = [];
+      const links: any[] = [];
+
+      const originalCreatorId = originalPost.user_id;
+      const originalCreatorProfile = resolveProfile(originalCreatorId);
+
+      nodes.push({
+        id: originalPostId,
+        userId: originalCreatorId,
+        label: `@${originalCreatorProfile.username}`,
+        displayName: originalCreatorProfile.display_name,
+        avatarUrl: originalCreatorProfile.avatar_url,
+        isVerified: originalCreatorProfile.is_verified,
+        role: 'creator',
+        postId: originalPostId,
+        createdAt: originalPost.created_at,
+        caption: originalPost.caption,
+        depth: 0
+      });
+
+      propagationRecords.forEach((cp: any) => {
+        const userProfile = resolveProfile(cp.user_id);
+        
+        nodes.push({
+          id: cp.post_id,
+          userId: cp.user_id,
+          label: `@${userProfile.username}`,
+          displayName: userProfile.display_name,
+          avatarUrl: userProfile.avatar_url,
+          isVerified: userProfile.is_verified,
+          role: cp.share_type,
+          postId: cp.post_id,
+          createdAt: cp.created_at,
+          caption: cp.share_type === 'quote' ? (localDb.posts.find(p => p.id === cp.post_id)?.caption || '') : '',
+          depth: cp.depth
+        });
+
+        const isParentOriginal = cp.parent_post_id === originalPostId;
+        const sourceId = isParentOriginal ? originalPostId : cp.parent_post_id;
+
+        links.push({
+          source: sourceId,
+          target: cp.post_id,
+          type: cp.share_type,
+          createdAt: cp.created_at
+        });
+      });
+
+      const spreadDepth = propagationRecords.length > 0 ? Math.max(...propagationRecords.map((cp: any) => cp.depth)) : 0;
+
+      let avgSpeedMinutes = 0;
+      if (propagationRecords.length > 0) {
+        let totalDiffMs = 0;
+        let count = 0;
+        propagationRecords.forEach((cp: any) => {
+          const parent = localDb.posts.find(p => p.id === cp.parent_post_id);
+          if (parent) {
+            const diff = new Date(cp.created_at).getTime() - new Date(parent.created_at).getTime();
+            totalDiffMs += Math.max(0, diff);
+            count++;
+          }
+        });
+        avgSpeedMinutes = count > 0 ? Math.round(totalDiffMs / (1000 * 60 * count)) : 0;
+      }
+
+      let longestChain: string[] = [];
+      if (propagationRecords.length > 0) {
+        const buildPath = (currPostId: string): string[] => {
+          const cp = propagationRecords.find(r => r.post_id === currPostId);
+          if (!cp) return [];
+          const profile = resolveProfile(cp.user_id);
+          return [...buildPath(cp.parent_post_id), `@${profile.username}`];
+        };
+        
+        let maxDepthRecord = propagationRecords[0];
+        propagationRecords.forEach((r: any) => {
+          if (r.depth > maxDepthRecord.depth) maxDepthRecord = r;
+        });
+
+        longestChain = [`@${originalCreatorProfile.username}`, ...buildPath(maxDepthRecord.post_id)];
+      } else {
+        longestChain = [`@${originalCreatorProfile.username}`];
+      }
+
+      const amplifierMap = new Map<string, number>();
+      propagationRecords.forEach((cp: any) => {
+        amplifierMap.set(cp.parent_user_id, (amplifierMap.get(cp.parent_user_id) || 0) + 1);
+      });
+      
+      const amplifiersList: any[] = [];
+      amplifierMap.forEach((downstreamCount, uid) => {
+        if (uid !== originalCreatorId) {
+          const prof = resolveProfile(uid);
+          amplifiersList.push({
+            username: prof.username,
+            displayName: prof.display_name,
+            avatarUrl: prof.avatar_url,
+            downstreamCount
+          });
+        }
+      });
+      amplifiersList.sort((a, b) => b.downstreamCount - a.downstreamCount);
+
+      res.json({
+        postId,
+        originalPostId,
+        originalCreator: {
+          userId: originalCreatorId,
+          ...originalCreatorProfile
+        },
+        nodes,
+        links,
+        analytics: {
+          totalShares: propagationRecords.length,
+          repostsCount: propagationRecords.filter((cp: any) => cp.share_type === 'repost').length,
+          quotesCount: propagationRecords.filter((cp: any) => cp.share_type === 'quote').length,
+          spreadDepth,
+          spreadSpeedMinutes: avgSpeedMinutes,
+          longestChain,
+          topAmplifiers: amplifiersList.slice(0, 3)
+        }
+      });
+    } catch (err: any) {
+      console.error('Stats error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/propagation/settings', (req, res) => {
+    const settings = localDb.system_settings?.[0] || { enable_propagation_tracking: true, max_propagation_depth: 10 };
+    res.json(settings);
+  });
+
+  app.post('/api/propagation/settings', (req, res) => {
+    try {
+      const { enable_propagation_tracking, max_propagation_depth } = req.body;
+      if (!localDb.system_settings) {
+        localDb.system_settings = [];
+      }
+      if (localDb.system_settings.length === 0) {
+        localDb.system_settings.push({ id: '1', enable_propagation_tracking: true, max_propagation_depth: 10 });
+      }
+      const item = localDb.system_settings[0];
+      if (enable_propagation_tracking !== undefined) {
+        item.enable_propagation_tracking = !!enable_propagation_tracking;
+      }
+      if (max_propagation_depth !== undefined) {
+        item.max_propagation_depth = parseInt(max_propagation_depth) || 10;
+      }
+      saveLocalDb();
+      res.json({ success: true, settings: item });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/propagation/records', (req, res) => {
+    const records = localDb.content_propagation || [];
+    const recordsWithUsernames = records.map((r: any) => {
+      const u = localDb.profiles.find(p => p.user_id === r.user_id);
+      const pu = localDb.profiles.find(p => p.user_id === r.parent_user_id);
+      const ou = localDb.profiles.find(p => p.user_id === r.original_user_id);
+      return {
+        ...r,
+        username: u?.username || 'unknown',
+        parent_username: pu?.username || 'unknown',
+        original_username: ou?.username || 'unknown'
+      };
+    });
+    res.json(recordsWithUsernames);
+  });
+
+  app.post('/api/propagation/records/save', (req, res) => {
+    try {
+      const record = req.body;
+      if (!localDb.content_propagation) {
+        localDb.content_propagation = [];
+      }
+      
+      if (record.id) {
+        const index = localDb.content_propagation.findIndex((r: any) => r.id === record.id);
+        if (index > -1) {
+          localDb.content_propagation[index] = {
+            ...localDb.content_propagation[index],
+            ...record,
+            updated_at: new Date().toISOString()
+          };
+          saveLocalDb();
+          return res.json({ success: true, record: localDb.content_propagation[index] });
+        }
+      }
+      
+      const newRecord = {
+        id: record.id || crypto.randomUUID(),
+        post_id: record.post_id || crypto.randomUUID(),
+        original_post_id: record.original_post_id || record.post_id || crypto.randomUUID(),
+        parent_post_id: record.parent_post_id || record.original_post_id || crypto.randomUUID(),
+        user_id: record.user_id || 'admin',
+        parent_user_id: record.parent_user_id || 'admin',
+        original_user_id: record.original_user_id || 'admin',
+        share_type: record.share_type || 'repost',
+        depth: parseInt(record.depth) || 1,
+        created_at: record.created_at || new Date().toISOString()
+      };
+      localDb.content_propagation.push(newRecord);
+      saveLocalDb();
+      res.json({ success: true, record: newRecord });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/propagation/records/delete', (req, res) => {
+    try {
+      const { id } = req.body;
+      if (!id) return res.status(400).json({ error: 'Missing id' });
+      if (localDb.content_propagation) {
+        localDb.content_propagation = localDb.content_propagation.filter((r: any) => r.id !== id);
+        saveLocalDb();
+      }
+      res.json({ success: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/propagation/export', (req, res) => {
+    try {
+      const data = {
+        exportedAt: new Date().toISOString(),
+        settings: localDb.system_settings?.[0] || { enable_propagation_tracking: true, max_propagation_depth: 10 },
+        records: localDb.content_propagation || [],
+        postsCount: localDb.posts.filter((p: any) => p.parent_post_id).length
+      };
+      res.setHeader('Content-disposition', 'attachment; filename=propagation_export.json');
+      res.setHeader('Content-type', 'application/json');
+      res.write(JSON.stringify(data, null, 2));
+      res.end();
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
     }
   });
 
@@ -2430,7 +2927,8 @@ app.get('/api/admin/db-status', (req, res) => {
   async function boot() {
     const PORT = 3000;
 
-    if (process.env.NODE_ENV !== 'production' && process.env.VERCEL !== '1') {
+    const distHtmlExists = fs.existsSync(path.join(process.cwd(), 'dist/index.html'));
+    if ((process.env.NODE_ENV !== 'production' || !distHtmlExists) && process.env.VERCEL !== '1' && fs.existsSync(path.join(process.cwd(), 'src/main.tsx'))) {
       const { createServer: createViteServer } = await import('vite');
       const vite = await createViteServer({
         server: { middlewareMode: true },

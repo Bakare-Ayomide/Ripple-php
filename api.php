@@ -184,12 +184,57 @@ try {
         UNIQUE KEY uq_saved_posts_user_post (user_id, post_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;");
 
+    // Ensure system_settings table exists
+    $pdo->exec("CREATE TABLE IF NOT EXISTS system_settings (
+        id VARCHAR(255) PRIMARY KEY,
+        enable_propagation_tracking BOOLEAN DEFAULT TRUE,
+        max_propagation_depth INT DEFAULT 10,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;");
+
+    // Seed default system_settings
+    $pdo->exec("INSERT IGNORE INTO system_settings (id, enable_propagation_tracking, max_propagation_depth) VALUES ('1', TRUE, 10);");
+
+    // Ensure content_propagation table exists
+    $pdo->exec("CREATE TABLE IF NOT EXISTS content_propagation (
+        id VARCHAR(255) PRIMARY KEY,
+        post_id VARCHAR(255) NOT NULL,
+        original_post_id VARCHAR(255) NOT NULL,
+        parent_post_id VARCHAR(255) NOT NULL,
+        user_id VARCHAR(255) NOT NULL,
+        parent_user_id VARCHAR(255) NOT NULL,
+        original_user_id VARCHAR(255) NOT NULL,
+        share_type VARCHAR(50) DEFAULT 'repost',
+        depth INT DEFAULT 1,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_cp_post_id (post_id),
+        INDEX idx_cp_original_post_id (original_post_id),
+        INDEX idx_cp_parent_post_id (parent_post_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;");
+
     // Perform any safety column migration patches
     try { $pdo->exec("ALTER TABLE profiles ADD COLUMN is_banned BOOLEAN DEFAULT FALSE"); } catch (Exception $e) {}
     try { $pdo->exec("ALTER TABLE profiles ADD COLUMN is_suspended BOOLEAN DEFAULT FALSE"); } catch (Exception $e) {}
     try { $pdo->exec("ALTER TABLE profiles ADD COLUMN is_onboarding_core BOOLEAN DEFAULT FALSE"); } catch (Exception $e) {}
+    try { $pdo->exec("ALTER TABLE profiles ADD COLUMN hide_propagation_details BOOLEAN DEFAULT FALSE"); } catch (Exception $e) {}
     try { $pdo->exec("ALTER TABLE stories ADD COLUMN media_type VARCHAR(50) DEFAULT 'image'"); } catch (Exception $e) {}
     try { $pdo->exec("ALTER TABLE stories ADD COLUMN thumbnail_url TEXT"); } catch (Exception $e) {}
+    try { $pdo->exec("ALTER TABLE posts ADD COLUMN original_post_id VARCHAR(255)"); } catch (Exception $e) {}
+    try { $pdo->exec("ALTER TABLE posts ADD COLUMN parent_post_id VARCHAR(255)"); } catch (Exception $e) {}
+    try { $pdo->exec("ALTER TABLE posts ADD COLUMN share_type VARCHAR(50)"); } catch (Exception $e) {}
+    try { $pdo->exec("ALTER TABLE posts ADD COLUMN propagation_depth INT DEFAULT 0"); } catch (Exception $e) {}
+    try { $pdo->exec("ALTER TABLE posts ADD COLUMN original_user_id VARCHAR(255)"); } catch (Exception $e) {}
+    try { $pdo->exec("ALTER TABLE posts ADD COLUMN scheduled_for TIMESTAMP NULL DEFAULT NULL"); } catch (Exception $e) {}
+    try { $pdo->exec("ALTER TABLE posts ADD COLUMN is_time_capsule BOOLEAN DEFAULT FALSE"); } catch (Exception $e) {}
+    try { $pdo->exec("ALTER TABLE posts ADD COLUMN unlocks_at TIMESTAMP NULL DEFAULT NULL"); } catch (Exception $e) {}
+    try { $pdo->exec("ALTER TABLE posts ADD COLUMN is_recurring BOOLEAN DEFAULT FALSE"); } catch (Exception $e) {}
+    try { $pdo->exec("ALTER TABLE posts ADD COLUMN recurrence_interval VARCHAR(50) DEFAULT NULL"); } catch (Exception $e) {}
+    try { $pdo->exec("ALTER TABLE posts ADD COLUMN is_published BOOLEAN DEFAULT TRUE"); } catch (Exception $e) {}
+    try { $pdo->exec("ALTER TABLE posts ADD COLUMN status VARCHAR(50) DEFAULT 'published'"); } catch (Exception $e) {}
+    try { $pdo->exec("ALTER TABLE posts ADD COLUMN is_moderated BOOLEAN DEFAULT FALSE"); } catch (Exception $e) {}
+    try { $pdo->exec("ALTER TABLE system_settings ADD COLUMN max_scheduling_duration_days INT DEFAULT 365"); } catch (Exception $e) {}
 
     // Seed targeted administrators if missing on MySQL startup
     $targetAdminsList = [
@@ -492,6 +537,81 @@ function handleMentions($text, $actorId, $postId, $isComment = false) {
     }
 }
 
+function isUserAdmin($pdo, $userId) {
+    if (!$userId) return false;
+    try {
+        $stmt = $pdo->prepare("SELECT role FROM user_roles WHERE user_id = ? AND role = 'admin' LIMIT 1");
+        $stmt->execute([$userId]);
+        return (bool)$stmt->fetch();
+    } catch (Exception $e) {
+        return false;
+    }
+}
+
+function processScheduledReleases($pdo) {
+    try {
+        $now = date('Y-m-d H:i:s');
+        // Find scheduled posts that are due, not published, and not currently blocked by moderation
+        $stmt = $pdo->prepare("SELECT * FROM posts WHERE status = 'scheduled' AND is_published = 0 AND is_moderated = 0 AND scheduled_for <= ?");
+        $stmt->execute([$now]);
+        $queuedPosts = $stmt->fetchAll();
+
+        foreach ($queuedPosts as $post) {
+            // Update status to 'published' and is_published to 1
+            $stmtUpd = $pdo->prepare("UPDATE posts SET status = 'published', is_published = 1, created_at = ? WHERE id = ?");
+            // Set created_at to scheduled_for so its position in the chronological timeline matches its release target
+            $stmtUpd->execute([$post['scheduled_for'], $post['id']]);
+
+            // Create notification for creator that their wave is published
+            try {
+                $stmtNotif = $pdo->prepare("INSERT INTO notifications (id, recipient_id, actor_id, type, post_id, content, is_read) VALUES (?, ?, ?, 'system', ?, 'Your scheduled wave was successfully published.', 0)");
+                $stmtNotif->execute([gen_uuid(), $post['user_id'], $post['id']]);
+            } catch (Exception $ex) {}
+
+            // Handle recurring schedule replication
+            if ($post['is_recurring'] && !empty($post['recurrence_interval'])) {
+                $interval = $post['recurrence_interval']; // 'daily', 'weekly', 'monthly'
+                $schedTime = strtotime($post['scheduled_for']);
+                if ($interval === 'daily') {
+                    $nextTime = strtotime('+1 day', $schedTime);
+                } else if ($interval === 'weekly') {
+                    $nextTime = strtotime('+1 week', $schedTime);
+                } else if ($interval === 'monthly') {
+                    $nextTime = strtotime('+1 month', $schedTime);
+                } else {
+                    $nextTime = strtotime('+1 day', $schedTime);
+                }
+                $nextSchedStr = date('Y-m-d H:i:s', $nextTime);
+                
+                // Clone/insert next scheduled post
+                $newPostId = gen_uuid();
+                $stmtIns = $pdo->prepare("
+                    INSERT INTO posts (id, user_id, caption, image_url, media_type, likes_count, comments_count, original_post_id, parent_post_id, share_type, propagation_depth, original_user_id, status, is_published, scheduled_for, is_recurring, recurrence_interval, is_time_capsule, unlocks_at, is_moderated)
+                    VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, 'scheduled', 0, ?, 1, ?, ?, ?, 0)
+                ");
+                $stmtIns->execute([
+                    $newPostId,
+                    $post['user_id'],
+                    $post['caption'],
+                    $post['image_url'],
+                    $post['media_type'] ?: 'image',
+                    $post['original_post_id'],
+                    $post['parent_post_id'],
+                    $post['share_type'],
+                    $post['propagation_depth'],
+                    $post['original_user_id'],
+                    $nextSchedStr,
+                    $interval,
+                    $post['is_time_capsule'] ? 1 : 0,
+                    $post['unlocks_at']
+                ]);
+            }
+        }
+    } catch (Exception $e) {
+        error_log("[processScheduledReleases Error] " . $e->getMessage());
+    }
+}
+
 // ================= ROUTING HANDLERS =================
 $route = $_GET['route'] ?? '';
 if (!$route) {
@@ -504,6 +624,13 @@ if (!$route) {
     }
 }
 $route = trim($route, '/');
+
+// Match dynamic routes like propagation/stats/{postId}
+$postId = '';
+if (preg_match('/^propagation\/stats\/(.+)$/', $route, $routeMatches)) {
+    $route = 'propagation/stats';
+    $postId = $routeMatches[1];
+}
 
 // Authenticated session validation helper
 function getAuthenticatedUser() {
@@ -532,6 +659,684 @@ function getAuthenticatedUser() {
 switch ($route) {
     case 'health':
         sendJson(['status' => 'ok', 'database' => 'mysql']);
+        break;
+
+    // ================= CONTENT PROPAGATION ENDPOINTS =================
+    case 'propagation/share':
+        if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+            sendJson(['error' => 'Method not allowed'], 405);
+        }
+
+        $body = json_decode(file_get_contents('php://input'), true);
+        $postId = $body['postId'] ?? '';
+        $userId = $body['userId'] ?? '';
+        $shareType = $body['shareType'] ?? '';
+        $caption = $body['caption'] ?? '';
+
+        if (empty($postId) || empty($userId) || empty($shareType)) {
+            sendJson(['error' => 'Missing required parameters'], 400);
+        }
+
+        try {
+            // Get settings
+            $stmtSet = $pdo->query("SELECT * FROM system_settings WHERE id = '1'");
+            $settings = $stmtSet->fetch() ?: [
+                'enable_propagation_tracking' => 1,
+                'max_propagation_depth' => 10
+            ];
+
+            // Get parent post
+            $stmtParent = $pdo->prepare("SELECT * FROM posts WHERE id = ?");
+            $stmtParent->execute([$postId]);
+            $parentPost = $stmtParent->fetch();
+
+            if (!$parentPost) {
+                sendJson(['error' => 'Parent post not found'], 404);
+            }
+
+            $parentDepth = (int)($parentPost['propagation_depth'] ?? 0);
+            $depth = $parentDepth + 1;
+
+            if ($depth > (int)$settings['max_propagation_depth']) {
+                sendJson(['error' => "Sharing blocked: Maximum propagation depth of " . $settings['max_propagation_depth'] . " reached."], 400);
+            }
+
+            $originalPostId = !empty($parentPost['original_post_id']) ? $parentPost['original_post_id'] : $parentPost['id'];
+            $originalUserId = !empty($parentPost['original_user_id']) ? $parentPost['original_user_id'] : $parentPost['user_id'];
+
+            $newPostId = gen_uuid();
+            $captionVal = ($shareType === 'quote') ? $caption : '[REPOST]';
+
+            // Insert new post
+            $stmtInsPost = $pdo->prepare("
+                INSERT INTO posts (id, user_id, caption, image_url, media_type, likes_count, comments_count, original_post_id, parent_post_id, share_type, propagation_depth, original_user_id)
+                VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?)
+            ");
+            $stmtInsPost->execute([
+                $newPostId,
+                $userId,
+                $captionVal,
+                $parentPost['image_url'],
+                $parentPost['media_type'] ?: 'image',
+                $originalPostId,
+                $parentPost['id'],
+                $shareType,
+                $depth,
+                $originalUserId
+            ]);
+
+            // Insert propagation record if enabled
+            $cpRecord = null;
+            if ($settings['enable_propagation_tracking']) {
+                $cpRecordId = gen_uuid();
+                $stmtInsCp = $pdo->prepare("
+                    INSERT INTO content_propagation (id, post_id, original_post_id, parent_post_id, user_id, parent_user_id, original_user_id, share_type, depth)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ");
+                $stmtInsCp->execute([
+                    $cpRecordId,
+                    $newPostId,
+                    $originalPostId,
+                    $parentPost['id'],
+                    $userId,
+                    $parentPost['user_id'],
+                    $originalUserId,
+                    $shareType,
+                    $depth
+                ]);
+
+                $cpRecord = [
+                    'id' => $cpRecordId,
+                    'post_id' => $newPostId,
+                    'original_post_id' => $originalPostId,
+                    'parent_post_id' => $parentPost['id'],
+                    'user_id' => $userId,
+                    'parent_user_id' => $parentPost['user_id'],
+                    'original_user_id' => $originalUserId,
+                    'share_type' => $shareType,
+                    'depth' => $depth,
+                    'created_at' => date('Y-m-d H:i:s')
+                ];
+            }
+
+            // Create notification for immediate parent
+            if ($parentPost['user_id'] !== $userId) {
+                $notifId = gen_uuid();
+                $notifContent = ($shareType === 'repost') ? 'reposted your wave.' : 'quoted your wave.';
+                $stmtNotif = $pdo->prepare("
+                    INSERT INTO notifications (id, recipient_id, actor_id, type, post_id, content, is_read)
+                    VALUES (?, ?, ?, ?, ?, ?, 0)
+                ");
+                $stmtNotif->execute([
+                    $notifId,
+                    $parentPost['user_id'],
+                    $userId,
+                    $shareType,
+                    $newPostId,
+                    $notifContent
+                ]);
+            }
+
+            // Create notification for original creator
+            if ($originalUserId !== $parentPost['user_id'] && $originalUserId !== $userId) {
+                $stmtProf = $pdo->prepare("SELECT username FROM profiles WHERE user_id = ?");
+                $stmtProf->execute([$parentPost['user_id']]);
+                $pRow = $stmtProf->fetch();
+                $pUsername = $pRow ? $pRow['username'] : 'user';
+
+                $notifId2 = gen_uuid();
+                $notifContent2 = "shared your original wave (via @$pUsername).";
+                $stmtNotif2 = $pdo->prepare("
+                    INSERT INTO notifications (id, recipient_id, actor_id, type, post_id, content, is_read)
+                    VALUES (?, ?, ?, ?, ?, ?, 0)
+                ");
+                $stmtNotif2->execute([
+                    $notifId2,
+                    $originalUserId,
+                    $userId,
+                    $shareType,
+                    $newPostId,
+                    $notifContent2
+                ]);
+            }
+
+            // FTP Storage Sync
+            savePostIdToFtp($newPostId);
+
+            // Fetch constructed new post to match returning payload
+            $stmtFetchNew = $pdo->prepare("
+                SELECT posts.*, 
+                       profiles.username as profile_username, 
+                       profiles.display_name as profile_display_name, 
+                       profiles.avatar_url as profile_avatar_url, 
+                       profiles.is_verified as profile_is_verified
+                FROM posts
+                LEFT JOIN profiles ON posts.user_id = profiles.user_id
+                WHERE posts.id = ?
+            ");
+            $stmtFetchNew->execute([$newPostId]);
+            $newPost = $stmtFetchNew->fetch();
+            if ($newPost) {
+                $newPost['profiles'] = [
+                    'username' => $newPost['profile_username'],
+                    'display_name' => $newPost['profile_display_name'],
+                    'avatar_url' => $newPost['profile_avatar_url'],
+                    'is_verified' => (bool)$newPost['profile_is_verified']
+                ];
+                $newPost['parent_post'] = null; // Handled dynamically in queries
+            }
+
+            sendJson([
+                'success' => true,
+                'post' => $newPost,
+                'propagation' => $cpRecord
+            ]);
+
+        } catch (Exception $e) {
+            sendJson(['error' => $e->getMessage()], 500);
+        }
+        break;
+
+    case 'propagation/stats':
+        if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
+            sendJson(['error' => 'Method not allowed'], 405);
+        }
+
+        if (empty($postId)) {
+            sendJson(['error' => 'Missing postId parameter'], 400);
+        }
+
+        try {
+            // Fetch post
+            $stmtPost = $pdo->prepare("SELECT * FROM posts WHERE id = ?");
+            $stmtPost->execute([$postId]);
+            $post = $stmtPost->fetch();
+
+            if (!$post) {
+                sendJson(['error' => 'Post not found'], 404);
+            }
+
+            $originalPostId = !empty($post['original_post_id']) ? $post['original_post_id'] : $post['id'];
+
+            // Fetch original post
+            $stmtOrig = $pdo->prepare("SELECT * FROM posts WHERE id = ?");
+            $stmtOrig->execute([$originalPostId]);
+            $originalPost = $stmtOrig->fetch() ?: $post;
+
+            // Fetch all propagation records for this cascade
+            $stmtCp = $pdo->prepare("SELECT * FROM content_propagation WHERE original_post_id = ? ORDER BY created_at ASC");
+            $stmtCp->execute([$originalPostId]);
+            $propagationRecords = $stmtCp->fetchAll();
+
+            // Profile resolver helper
+            $resolveProfile = function($uid) use ($pdo) {
+                $st = $pdo->prepare("SELECT username, display_name, avatar_url, is_verified, hide_propagation_details FROM profiles WHERE user_id = ?");
+                $st->execute([$uid]);
+                $prof = $st->fetch();
+
+                if (!$prof) {
+                    return [
+                        'username' => 'unknown',
+                        'display_name' => 'Unknown Member',
+                        'avatar_url' => "https://api.dicebear.com/7.x/adventurer/svg?seed=$uid",
+                        'is_verified' => false,
+                        'hide_propagation_details' => false
+                    ];
+                }
+
+                if (!empty($prof['hide_propagation_details'])) {
+                    return [
+                        'username' => 'anonymous',
+                        'display_name' => 'Anonymous Wave',
+                        'avatar_url' => 'https://api.dicebear.com/7.x/adventurer/svg?seed=anonymous',
+                        'is_verified' => false,
+                        'hide_propagation_details' => true
+                    ];
+                }
+
+                return [
+                    'username' => $prof['username'] ?: 'user',
+                    'display_name' => $prof['display_name'] ?: 'Member',
+                    'avatar_url' => $prof['avatar_url'] ?: "https://api.dicebear.com/7.x/adventurer/svg?seed=$uid",
+                    'is_verified' => (bool)$prof['is_verified'],
+                    'hide_propagation_details' => false
+                ];
+            };
+
+            $nodes = [];
+            $links = [];
+
+            $originalCreatorId = $originalPost['user_id'];
+            $originalCreatorProfile = $resolveProfile($originalCreatorId);
+
+            // Add creator node
+            $nodes[] = [
+                'id' => $originalPostId,
+                'userId' => $originalCreatorId,
+                'label' => '@' . $originalCreatorProfile['username'],
+                'displayName' => $originalCreatorProfile['display_name'],
+                'avatarUrl' => $originalCreatorProfile['avatar_url'],
+                'isVerified' => $originalCreatorProfile['is_verified'],
+                'role' => 'creator',
+                'postId' => $originalPostId,
+                'createdAt' => $originalPost['created_at'],
+                'caption' => $originalPost['caption'],
+                'depth' => 0
+            ];
+
+            // Build other nodes & links
+            foreach ($propagationRecords as $cp) {
+                $userProfile = $resolveProfile($cp['user_id']);
+
+                // Fetch caption for quote shares
+                $captionText = '';
+                if ($cp['share_type'] === 'quote') {
+                    $stPost = $pdo->prepare("SELECT caption FROM posts WHERE id = ?");
+                    $stPost->execute([$cp['post_id']]);
+                    $capRow = $stPost->fetch();
+                    $captionText = $capRow ? $capRow['caption'] : '';
+                }
+
+                $nodes[] = [
+                    'id' => $cp['post_id'],
+                    'userId' => $cp['user_id'],
+                    'label' => '@' . $userProfile['username'],
+                    'displayName' => $userProfile['display_name'],
+                    'avatarUrl' => $userProfile['avatar_url'],
+                    'isVerified' => $userProfile['is_verified'],
+                    'role' => $cp['share_type'],
+                    'postId' => $cp['post_id'],
+                    'createdAt' => $cp['created_at'],
+                    'caption' => $captionText,
+                    'depth' => (int)$cp['depth']
+                ];
+
+                $isParentOriginal = $cp['parent_post_id'] === $originalPostId;
+                $sourceId = $isParentOriginal ? $originalPostId : $cp['parent_post_id'];
+
+                $links[] = [
+                    'source' => $sourceId,
+                    'target' => $cp['post_id'],
+                    'type' => $cp['share_type'],
+                    'createdAt' => $cp['created_at']
+                ];
+            }
+
+            // Calculate spread depth
+            $spreadDepth = 0;
+            if (count($propagationRecords) > 0) {
+                $depths = array_map(function($r) { return (int)$r['depth']; }, $propagationRecords);
+                $spreadDepth = max($depths);
+            }
+
+            // Calculate spread speed
+            $avgSpeedMinutes = 0;
+            if (count($propagationRecords) > 0) {
+                $totalDiffMs = 0;
+                $count = 0;
+                foreach ($propagationRecords as $cp) {
+                    $stmtP = $pdo->prepare("SELECT created_at FROM posts WHERE id = ?");
+                    $stmtP->execute([$cp['parent_post_id']]);
+                    $parent = $stmtP->fetch();
+                    if ($parent) {
+                        $diff = strtotime($cp['created_at']) - strtotime($parent['created_at']);
+                        $totalDiffMs += max(0, $diff);
+                        $count++;
+                    }
+                }
+                $avgSpeedMinutes = $count > 0 ? round(($totalDiffMs / 60) / $count) : 0;
+            }
+
+            // Calculate longest chain
+            $longestChain = [];
+            if (count($propagationRecords) > 0) {
+                // Find deep record
+                $maxDepthRecord = $propagationRecords[0];
+                foreach ($propagationRecords as $r) {
+                    if ((int)$r['depth'] > (int)$maxDepthRecord['depth']) {
+                        $maxDepthRecord = $r;
+                    }
+                }
+
+                // Helper recursive builder
+                $buildPathRecursive = function($currPostId) use (&$buildPathRecursive, $propagationRecords, $resolveProfile) {
+                    $cp = null;
+                    foreach ($propagationRecords as $r) {
+                        if ($r['post_id'] === $currPostId) {
+                            $cp = $r;
+                            break;
+                        }
+                    }
+                    if (!$cp) return [];
+                    $userProfile = $resolveProfile($cp['user_id']);
+                    return array_merge($buildPathRecursive($cp['parent_post_id']), ['@' . $userProfile['username']]);
+                };
+
+                $longestChain = array_merge(['@' . $originalCreatorProfile['username']], $buildPathRecursive($maxDepthRecord['post_id']));
+            } else {
+                $longestChain = ['@' . $originalCreatorProfile['username']];
+            }
+
+            // Calculate top amplifiers
+            $amplifierMap = [];
+            foreach ($propagationRecords as $cp) {
+                $pUid = $cp['parent_user_id'];
+                if (!isset($amplifierMap[$pUid])) {
+                    $amplifierMap[$pUid] = 0;
+                }
+                $amplifierMap[$pUid]++;
+            }
+
+            $amplifiersList = [];
+            foreach ($amplifierMap as $uid => $downstreamCount) {
+                if ($uid !== $originalCreatorId) {
+                    $prof = $resolveProfile($uid);
+                    $amplifiersList[] = [
+                        'username' => $prof['username'],
+                        'displayName' => $prof['display_name'],
+                        'avatarUrl' => $prof['avatar_url'],
+                        'downstreamCount' => $downstreamCount
+                    ];
+                }
+            }
+
+            // Sort amplifiers descending
+            usort($amplifiersList, function($a, $b) {
+                return $b['downstreamCount'] - $a['downstreamCount'];
+            });
+
+            sendJson([
+                'postId' => $postId,
+                'originalPostId' => $originalPostId,
+                'originalCreator' => array_merge(['userId' => $originalCreatorId], $originalCreatorProfile),
+                'nodes' => $nodes,
+                'links' => $links,
+                'analytics' => [
+                    'totalShares' => count($propagationRecords),
+                    'repostsCount' => count(array_filter($propagationRecords, function($r) { return $r['share_type'] === 'repost'; })),
+                    'quotesCount' => count(array_filter($propagationRecords, function($r) { return $r['share_type'] === 'quote'; })),
+                    'spreadDepth' => $spreadDepth,
+                    'spreadSpeedMinutes' => (int)$avgSpeedMinutes,
+                    'longestChain' => $longestChain,
+                    'topAmplifiers' => array_slice($amplifiersList, 0, 3)
+                ]
+            ]);
+
+        } catch (Exception $e) {
+            sendJson(['error' => $e->getMessage()], 500);
+        }
+        break;
+
+    case 'propagation/settings':
+        if ($_SERVER['REQUEST_METHOD'] === 'GET') {
+            try {
+                $stmt = $pdo->query("SELECT * FROM system_settings WHERE id = '1'");
+                $settings = $stmt->fetch();
+                if (!$settings) {
+                    $settings = [
+                        'id' => '1',
+                        'enable_propagation_tracking' => 1,
+                        'max_propagation_depth' => 10,
+                        'max_scheduling_duration_days' => 365
+                    ];
+                } else {
+                    $settings['enable_propagation_tracking'] = (bool)$settings['enable_propagation_tracking'];
+                    $settings['max_propagation_depth'] = (int)$settings['max_propagation_depth'];
+                    $settings['max_scheduling_duration_days'] = isset($settings['max_scheduling_duration_days']) ? (int)$settings['max_scheduling_duration_days'] : 365;
+                }
+                sendJson($settings);
+            } catch (Exception $e) {
+                sendJson(['error' => $e->getMessage()], 500);
+            }
+        } else if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+            $body = json_decode(file_get_contents('php://input'), true);
+            $enable = $body['enable_propagation_tracking'] ?? null;
+            $maxDepth = $body['max_propagation_depth'] ?? null;
+            $maxSchedDays = $body['max_scheduling_duration_days'] ?? null;
+
+            try {
+                $stmt = $pdo->query("SELECT * FROM system_settings WHERE id = '1'");
+                $exists = $stmt->fetch();
+
+                if (!$exists) {
+                    $stmtIns = $pdo->prepare("INSERT INTO system_settings (id, enable_propagation_tracking, max_propagation_depth, max_scheduling_duration_days) VALUES ('1', ?, ?, ?)");
+                    $stmtIns->execute([
+                        $enable !== null ? ($enable ? 1 : 0) : 1,
+                        $maxDepth !== null ? (int)$maxDepth : 10,
+                        $maxSchedDays !== null ? (int)$maxSchedDays : 365
+                    ]);
+                } else {
+                    $fields = [];
+                    $params = [];
+                    if ($enable !== null) {
+                        $fields[] = "enable_propagation_tracking = ?";
+                        $params[] = $enable ? 1 : 0;
+                    }
+                    if ($maxDepth !== null) {
+                        $fields[] = "max_propagation_depth = ?";
+                        $params[] = (int)$maxDepth;
+                    }
+                    if ($maxSchedDays !== null) {
+                        $fields[] = "max_scheduling_duration_days = ?";
+                        $params[] = (int)$maxSchedDays;
+                    }
+
+                    if (count($fields) > 0) {
+                        $params[] = '1';
+                        $stmtUpd = $pdo->prepare("UPDATE system_settings SET " . implode(', ', $fields) . " WHERE id = ?");
+                        $stmtUpd->execute($params);
+                    }
+                }
+
+                // Return final settings
+                $stmtFinal = $pdo->query("SELECT * FROM system_settings WHERE id = '1'");
+                $settings = $stmtFinal->fetch();
+                $settings['enable_propagation_tracking'] = (bool)$settings['enable_propagation_tracking'];
+                $settings['max_propagation_depth'] = (int)$settings['max_propagation_depth'];
+                $settings['max_scheduling_duration_days'] = isset($settings['max_scheduling_duration_days']) ? (int)$settings['max_scheduling_duration_days'] : 365;
+
+                sendJson(['success' => true, 'settings' => $settings]);
+
+            } catch (Exception $e) {
+                sendJson(['error' => $e->getMessage()], 500);
+            }
+        } else {
+            sendJson(['error' => 'Method not allowed'], 405);
+        }
+        break;
+
+    case 'propagation/records':
+        if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
+            sendJson(['error' => 'Method not allowed'], 405);
+        }
+
+        try {
+            $stmt = $pdo->query("
+                SELECT cp.*, 
+                       p1.username as username,
+                       p2.username as parent_username,
+                       p3.username as original_username
+                FROM content_propagation cp
+                LEFT JOIN profiles p1 ON cp.user_id = p1.user_id
+                LEFT JOIN profiles p2 ON cp.parent_user_id = p2.user_id
+                LEFT JOIN profiles p3 ON cp.original_user_id = p3.user_id
+                ORDER BY cp.created_at DESC
+            ");
+            $records = $stmt->fetchAll() ?: [];
+            
+            // Format types
+            foreach ($records as &$r) {
+                $r['depth'] = (int)$r['depth'];
+                $r['username'] = $r['username'] ?: 'unknown';
+                $r['parent_username'] = $r['parent_username'] ?: 'unknown';
+                $r['original_username'] = $r['original_username'] ?: 'unknown';
+            }
+
+            sendJson($records);
+        } catch (Exception $e) {
+            sendJson(['error' => $e->getMessage()], 500);
+        }
+        break;
+
+    case 'propagation/records/save':
+        if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+            sendJson(['error' => 'Method not allowed'], 405);
+        }
+
+        $body = json_decode(file_get_contents('php://input'), true);
+        $id = $body['id'] ?? '';
+        $postId = $body['post_id'] ?? '';
+        $originalPostId = $body['original_post_id'] ?? '';
+        $parentPostId = $body['parent_post_id'] ?? '';
+        $userId = $body['user_id'] ?? '';
+        $parentUserId = $body['parent_user_id'] ?? '';
+        $originalUserId = $body['original_user_id'] ?? '';
+        $shareType = $body['share_type'] ?? 'repost';
+        $depth = $body['depth'] ?? 1;
+
+        try {
+            if (!empty($id)) {
+                // Check if exists
+                $stmtCheck = $pdo->prepare("SELECT id FROM content_propagation WHERE id = ?");
+                $stmtCheck->execute([$id]);
+                $exists = $stmtCheck->fetch();
+
+                if ($exists) {
+                    $stmtUpd = $pdo->prepare("
+                        UPDATE content_propagation 
+                        SET post_id = ?, original_post_id = ?, parent_post_id = ?, user_id = ?, parent_user_id = ?, original_user_id = ?, share_type = ?, depth = ?
+                        WHERE id = ?
+                    ");
+                    $stmtUpd->execute([
+                        $postId ?: gen_uuid(),
+                        $originalPostId ?: gen_uuid(),
+                        $parentPostId ?: gen_uuid(),
+                        $userId ?: 'admin',
+                        $parentUserId ?: 'admin',
+                        $originalUserId ?: 'admin',
+                        $shareType,
+                        (int)$depth,
+                        $id
+                    ]);
+
+                    sendJson([
+                        'success' => true,
+                        'record' => [
+                            'id' => $id,
+                            'post_id' => $postId,
+                            'original_post_id' => $originalPostId,
+                            'parent_post_id' => $parentPostId,
+                            'user_id' => $userId,
+                            'parent_user_id' => $parentUserId,
+                            'original_user_id' => $originalUserId,
+                            'share_type' => $shareType,
+                            'depth' => (int)$depth
+                        ]
+                    ]);
+                }
+            }
+
+            // Create new
+            $newId = !empty($id) ? $id : gen_uuid();
+            $stmtIns = $pdo->prepare("
+                INSERT INTO content_propagation (id, post_id, original_post_id, parent_post_id, user_id, parent_user_id, original_user_id, share_type, depth)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ");
+            $stmtIns->execute([
+                $newId,
+                $postId ?: gen_uuid(),
+                $originalPostId ?: $postId,
+                $parentPostId ?: $originalPostId,
+                $userId ?: 'admin',
+                $parentUserId ?: 'admin',
+                $originalUserId ?: 'admin',
+                $shareType,
+                (int)$depth
+            ]);
+
+            sendJson([
+                'success' => true,
+                'record' => [
+                    'id' => $newId,
+                    'post_id' => $postId,
+                    'original_post_id' => $originalPostId,
+                    'parent_post_id' => $parentPostId,
+                    'user_id' => $userId,
+                    'parent_user_id' => $parentUserId,
+                    'original_user_id' => $originalUserId,
+                    'share_type' => $shareType,
+                    'depth' => (int)$depth
+                ]
+            ]);
+
+        } catch (Exception $e) {
+            sendJson(['error' => $e->getMessage()], 500);
+        }
+        break;
+
+    case 'propagation/records/delete':
+        if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+            sendJson(['error' => 'Method not allowed'], 405);
+        }
+
+        $body = json_decode(file_get_contents('php://input'), true);
+        $id = $body['id'] ?? '';
+
+        if (empty($id)) {
+            sendJson(['error' => 'Missing id'], 400);
+        }
+
+        try {
+            $stmt = $pdo->prepare("DELETE FROM content_propagation WHERE id = ?");
+            $stmt->execute([$id]);
+            sendJson(['success' => true]);
+        } catch (Exception $e) {
+            sendJson(['error' => $e->getMessage()], 500);
+        }
+        break;
+
+    case 'propagation/export':
+        if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
+            sendJson(['error' => 'Method not allowed'], 405);
+        }
+
+        try {
+            // Fetch settings
+            $stmtSet = $pdo->query("SELECT * FROM system_settings WHERE id = '1'");
+            $settings = $stmtSet->fetch() ?: [
+                'enable_propagation_tracking' => 1,
+                'max_propagation_depth' => 10
+            ];
+            $settings['enable_propagation_tracking'] = (bool)$settings['enable_propagation_tracking'];
+            $settings['max_propagation_depth'] = (int)$settings['max_propagation_depth'];
+
+            // Fetch records
+            $stmtCp = $pdo->query("SELECT * FROM content_propagation ORDER BY created_at DESC");
+            $records = $stmtCp->fetchAll() ?: [];
+            foreach ($records as &$r) {
+                $r['depth'] = (int)$r['depth'];
+            }
+
+            // Count reposts/quotes
+            $stmtCount = $pdo->query("SELECT COUNT(*) as cnt FROM posts WHERE parent_post_id IS NOT NULL");
+            $postsCount = $stmtCount->fetch();
+            $postsCountVal = $postsCount ? (int)$postsCount['cnt'] : 0;
+
+            $data = [
+                'exportedAt' => date('c'),
+                'settings' => $settings,
+                'records' => $records,
+                'postsCount' => $postsCountVal
+            ];
+
+            header('Content-Disposition: attachment; filename="propagation_export.json"');
+            header('Content-Type: application/json');
+            echo json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+            exit();
+
+        } catch (Exception $e) {
+            sendJson(['error' => $e->getMessage()], 500);
+        }
         break;
 
     case 'admin/db-status':
@@ -1083,16 +1888,38 @@ switch ($route) {
 
         $body = json_decode(file_get_contents('php://input'), true);
         $id = $body['id'] ?? '';
-        $caption = $body['caption'] ?? '';
-        $image_url = $body['image_url'] ?? '';
 
         if (empty($id)) {
             sendJson(['error' => 'Missing post id.'], 400);
         }
 
         try {
-            $stmt = $pdo->prepare("UPDATE posts SET caption = ?, image_url = ? WHERE id = ?");
-            $stmt->execute([$caption, $image_url, $id]);
+            $allowedFields = [
+                'caption', 'image_url', 'media_type', 'is_moderated',
+                'status', 'is_published', 'scheduled_for', 'unlocks_at',
+                'is_recurring', 'recurrence_interval'
+            ];
+            $updates = [];
+            $params = [];
+
+            foreach ($allowedFields as $field) {
+                if (array_key_exists($field, $body)) {
+                    $updates[] = "$field = ?";
+                    $val = $body[$field];
+                    if (is_bool($val)) {
+                        $params[] = $val ? 1 : 0;
+                    } else {
+                        $params[] = $val;
+                    }
+                }
+            }
+
+            if (!empty($updates)) {
+                $params[] = $id;
+                $query = "UPDATE posts SET " . implode(", ", $updates) . " WHERE id = ?";
+                $stmt = $pdo->prepare($query);
+                $stmt->execute($params);
+            }
 
             // Sync FTP
             savePostIdToFtp($id);
@@ -1269,6 +2096,30 @@ switch ($route) {
                 if ($table === 'posts') {
                     // Sync FTP files recursively
                     syncPostsFromFtp();
+
+                    // Process scheduled releases before querying
+                    processScheduledReleases($pdo);
+
+                    // Apply visibility filters for scheduled posts
+                    $currentUserId = $authUser ? $authUser['id'] : '';
+                    $isAdminUser = isUserAdmin($pdo, $currentUserId);
+
+                    if (!$isAdminUser) {
+                        // Check if the query itself is searching for scheduled status. If not, filter it.
+                        // We allow the creator of a scheduled post to query their own scheduled posts.
+                        if (!empty($currentUserId)) {
+                            $whereClauses[] = "(
+                                (posts.status != 'scheduled' AND posts.is_published = 1)
+                                OR (posts.user_id = ?)
+                            )";
+                            $params[] = $currentUserId;
+                        } else {
+                            $whereClauses[] = "(posts.status != 'scheduled' AND posts.is_published = 1)";
+                        }
+                    }
+
+                    $whereSql = count($whereClauses) > 0 ? "WHERE " . implode(' AND ', $whereClauses) : '';
+
                     $sql = "
                         SELECT posts.*, 
                                profiles.username as profile_username, 
@@ -1334,12 +2185,73 @@ switch ($route) {
                     if (isset($formatted['is_read'])) $formatted['is_read'] = (bool)$formatted['is_read'];
 
                     if ($table === 'posts') {
+                        // Check if locked time capsule
+                        $isTimeCapsule = !empty($r['is_time_capsule']);
+                        $isLocked = false;
+                        if ($isTimeCapsule && !empty($r['unlocks_at'])) {
+                            $unlocksTime = strtotime($r['unlocks_at']);
+                            if ($unlocksTime > time()) {
+                                $isLocked = true;
+                            }
+                        }
+
+                        $currentUserId = $authUser ? $authUser['id'] : '';
+                        $isAdminUser = isUserAdmin($pdo, $currentUserId);
+                        $isOwner = $currentUserId === $r['user_id'];
+
+                        if ($isLocked && !$isOwner && !$isAdminUser) {
+                            $formatted['caption'] = "⏳ Locked Time Capsule (Unlocks " . date('Y-m-d H:i', strtotime($r['unlocks_at'])) . ")";
+                            $formatted['image_url'] = "";
+                            $formatted['is_locked_capsule'] = true;
+                        } else {
+                            $formatted['is_locked_capsule'] = false;
+                        }
+
+                        $formatted['is_time_capsule'] = (bool)($r['is_time_capsule'] ?? false);
+                        $formatted['is_recurring'] = (bool)($r['is_recurring'] ?? false);
+                        $formatted['is_published'] = (bool)($r['is_published'] ?? false);
+                        $formatted['is_moderated'] = (bool)($r['is_moderated'] ?? false);
+
                         $formatted['profiles'] = [
                             'username' => $r['profile_username'] ?? null,
                             'display_name' => $r['profile_display_name'] ?? null,
                             'avatar_url' => $r['profile_avatar_url'] ?? null,
                             'is_verified' => isset($r['profile_is_verified']) ? (bool)$r['profile_is_verified'] : false
                         ];
+
+                        $parentPostInfo = null;
+                        if (!empty($r['parent_post_id'])) {
+                            try {
+                                $stmtParent = $pdo->prepare("
+                                    SELECT posts.*, 
+                                           profiles.username as parent_username, 
+                                           profiles.display_name as parent_display_name, 
+                                           profiles.avatar_url as parent_avatar_url
+                                    FROM posts
+                                    LEFT JOIN profiles ON posts.user_id = profiles.user_id
+                                    WHERE posts.id = ?
+                                    LIMIT 1
+                                ");
+                                $stmtParent->execute([$r['parent_post_id']]);
+                                $parentRow = $stmtParent->fetch();
+                                if ($parentRow) {
+                                    $parentPostInfo = [
+                                        'id' => $parentRow['id'],
+                                        'caption' => $parentRow['caption'],
+                                        'image_url' => $parentRow['image_url'],
+                                        'media_type' => $parentRow['media_type'] ?? 'image',
+                                        'user_id' => $parentRow['user_id'],
+                                        'username' => $parentRow['parent_username'],
+                                        'display_name' => $parentRow['parent_display_name'],
+                                        'avatar_url' => $parentRow['parent_avatar_url']
+                                    ];
+                                }
+                            } catch (Exception $e) {
+                                error_log("[PHP parent_post fetch error] " . $e->getMessage());
+                            }
+                        }
+                        $formatted['parent_post'] = $parentPostInfo;
+
                     } else if ($table === 'comments') {
                         $formatted['profiles'] = [
                             'username' => $r['profile_username'] ?? null,
@@ -1362,8 +2274,86 @@ switch ($route) {
                         ] : null;
                     } else if ($table === 'profiles') {
                         $formatted['is_verified'] = (bool)($r['is_verified'] ?? false);
+                        $formatted['hide_propagation_details'] = (bool)($r['hide_propagation_details'] ?? false);
                     } else if ($table === 'messages') {
                         $formatted['is_read'] = (bool)($r['is_read'] ?? false);
+                    } else if ($table === 'content_propagation') {
+                        // Fetch details for prof, parentProf, originalProf, post, parentPost, originalPost
+                        $prof = null; $parentProf = null; $originalProf = null;
+                        $post = null; $parentPost = null; $originalPost = null;
+
+                        if (!empty($r['user_id'])) {
+                            $st = $pdo->prepare("SELECT username, display_name, avatar_url, is_verified, hide_propagation_details FROM profiles WHERE user_id = ?");
+                            $st->execute([$r['user_id']]);
+                            $prof = $st->fetch() ?: null;
+                        }
+                        if (!empty($r['parent_user_id'])) {
+                            $st = $pdo->prepare("SELECT username, display_name, avatar_url, is_verified, hide_propagation_details FROM profiles WHERE user_id = ?");
+                            $st->execute([$r['parent_user_id']]);
+                            $parentProf = $st->fetch() ?: null;
+                        }
+                        if (!empty($r['original_user_id'])) {
+                            $st = $pdo->prepare("SELECT username, display_name, avatar_url, is_verified, hide_propagation_details FROM profiles WHERE user_id = ?");
+                            $st->execute([$r['original_user_id']]);
+                            $originalProf = $st->fetch() ?: null;
+                        }
+                        if (!empty($r['post_id'])) {
+                            $st = $pdo->prepare("SELECT caption, image_url, created_at FROM posts WHERE id = ?");
+                            $st->execute([$r['post_id']]);
+                            $post = $st->fetch() ?: null;
+                        }
+                        if (!empty($r['parent_post_id'])) {
+                            $st = $pdo->prepare("SELECT caption, image_url, created_at FROM posts WHERE id = ?");
+                            $st->execute([$r['parent_post_id']]);
+                            $parentPost = $st->fetch() ?: null;
+                        }
+                        if (!empty($r['original_post_id'])) {
+                            $st = $pdo->prepare("SELECT caption, image_url, created_at FROM posts WHERE id = ?");
+                            $st->execute([$r['original_post_id']]);
+                            $originalPost = $st->fetch() ?: null;
+                        }
+
+                        $formatted['profiles'] = $prof ? [
+                            'username' => $prof['username'] ?? '',
+                            'display_name' => $prof['display_name'] ?? '',
+                            'avatar_url' => $prof['avatar_url'] ?? '',
+                            'is_verified' => (bool)($prof['is_verified'] ?? false),
+                            'hide_propagation_details' => (bool)($prof['hide_propagation_details'] ?? false)
+                        ] : null;
+
+                        $formatted['parent_profile'] = $parentProf ? [
+                            'username' => $parentProf['username'] ?? '',
+                            'display_name' => $parentProf['display_name'] ?? '',
+                            'avatar_url' => $parentProf['avatar_url'] ?? '',
+                            'is_verified' => (bool)($parentProf['is_verified'] ?? false),
+                            'hide_propagation_details' => (bool)($parentProf['hide_propagation_details'] ?? false)
+                        ] : null;
+
+                        $formatted['original_profile'] = $originalProf ? [
+                            'username' => $originalProf['username'] ?? '',
+                            'display_name' => $originalProf['display_name'] ?? '',
+                            'avatar_url' => $originalProf['avatar_url'] ?? '',
+                            'is_verified' => (bool)($originalProf['is_verified'] ?? false),
+                            'hide_propagation_details' => (bool)($originalProf['hide_propagation_details'] ?? false)
+                        ] : null;
+
+                        $formatted['post'] = $post ? [
+                            'caption' => $post['caption'] ?? '',
+                            'image_url' => $post['image_url'] ?? '',
+                            'created_at' => $post['created_at'] ?? ''
+                        ] : null;
+
+                        $formatted['parent_post'] = $parentPost ? [
+                            'caption' => $parentPost['caption'] ?? '',
+                            'image_url' => $parentPost['image_url'] ?? '',
+                            'created_at' => $parentPost['created_at'] ?? ''
+                        ] : null;
+
+                        $formatted['original_post'] = $originalPost ? [
+                            'caption' => $originalPost['caption'] ?? '',
+                            'image_url' => $originalPost['image_url'] ?? '',
+                            'created_at' => $originalPost['created_at'] ?? ''
+                        ] : null;
                     }
                     $data[] = $formatted;
                 }
