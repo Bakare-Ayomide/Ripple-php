@@ -2928,7 +2928,7 @@ app.get('/api/admin/db-status', (req, res) => {
     const PORT = 3000;
 
     const distHtmlExists = fs.existsSync(path.join(process.cwd(), 'dist/index.html'));
-    if ((process.env.NODE_ENV !== 'production' || !distHtmlExists) && process.env.VERCEL !== '1' && fs.existsSync(path.join(process.cwd(), 'src/main.tsx'))) {
+    if (process.env.NODE_ENV !== 'production' && !distHtmlExists && process.env.VERCEL !== '1' && fs.existsSync(path.join(process.cwd(), 'src/main.tsx'))) {
       const { createServer: createViteServer } = await import('vite');
       const vite = await createViteServer({
         server: { middlewareMode: true },
